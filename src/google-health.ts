@@ -1,12 +1,6 @@
 /**
  * Minimal client for the Google Health API v4 (the Fitbit-data cloud API).
- *
  * Docs: https://developers.google.com/health/reference/rest/v4
- *
- * We deliberately keep this thin: tools mostly pass the API's JSON straight
- * through to Claude, which is perfectly capable of reasoning over structured
- * health data. The client's only real jobs are (1) building the slightly fiddly
- * dailyRollUp request bodies and (2) transparently refreshing the access token.
  */
 
 import { toCivilDate, nextDayIso, buildTimeFilter, todayIso } from "./dates";
@@ -30,11 +24,8 @@ export interface GoogleHealthClientOptions {
   refreshToken?: string;
   clientId: string;
   clientSecret: string;
-  /** Optional KV cache for immutable past-day responses. */
   cache?: KVNamespace;
-  /** Identifies the user, so cache keys never leak across accounts. */
   userId?: string;
-  /** IANA timezone used to decide whether a range is wholly in the past. */
   timeZone?: string;
 }
 
@@ -57,12 +48,6 @@ export class GoogleHealthClient {
     this.timeZone = opts.timeZone ?? "UTC";
   }
 
-  /**
-   * Wrap a date-range fetch with KV caching. Only ranges that end strictly
-   * before today (in the user's timezone) are cached — those days are final
-   * and immutable. Any range touching today is always fetched live. Cache
-   * failures (read or write) never break the request.
-   */
   private async withCache(
     keyParts: unknown[],
     endDate: string,
@@ -88,29 +73,16 @@ export class GoogleHealthClient {
     return result;
   }
 
-  /**
-   * Daily-aggregated values for a data type over an inclusive date range.
-   * Best for trends: resting HR, HRV, sleep summaries, active-zone-minutes.
-   *
-   * @param dataType e.g. "resting-heart-rate", "heart-rate-variability", "sleep"
-   * @param startDate inclusive "YYYY-MM-DD"
-   * @param endDate   inclusive "YYYY-MM-DD"
-   */
   async dailyRollUp(
     dataType: string,
     startDate: string,
     endDate: string,
   ): Promise<unknown> {
     const url = `${HEALTH_BASE}/users/me/dataTypes/${dataType}/dataPoints:dailyRollUp`;
-    // CivilTimeInterval: start inclusive, end exclusive. Each bound is a
-    // CivilDateTime ({ date, time? }); omitting `time` defaults to midnight,
-    // which aligns with the daily aggregation window. We advance the caller's
-    // inclusive end by one day to make it the exclusive upper bound.
     const range = {
       start: { date: toCivilDate(startDate) },
       end: { date: toCivilDate(nextDayIso(endDate)) },
     };
-    // pageToken (when present) goes in the POST body for this method.
     return this.withCache(["dailyRollUp", dataType, startDate, endDate], endDate, () =>
       this.paginate("rollupDataPoints", (pageToken) =>
         this.request(url, {
@@ -121,25 +93,14 @@ export class GoogleHealthClient {
     );
   }
 
-  /**
-   * Raw individual data points for a data type within a time window.
-   * Use when you need intra-day detail rather than daily rollups.
-   *
-   * @param dataType   e.g. "heart-rate", "sleep"
-   * @param startTime  RFC-3339 timestamp, e.g. "2026-06-10T00:00:00Z"
-   * @param endTime    RFC-3339 timestamp, exclusive upper bound
-   * @param pageSize   optional cap (API default 1440; sleep/exercise max 25)
-   */
   async list(
     dataType: string,
     startTime: string,
     endTime: string,
     pageSize?: number,
   ): Promise<unknown> {
-    // The filter field is "<dataType>.interval.start_time" (underscored) per AIP-160.
     const field = `${dataType.replace(/-/g, "_")}.interval.start_time`;
     const filter = `${field} >= "${startTime}" AND ${field} < "${endTime}"`;
-    // pageToken (when present) goes in the query string for this method.
     return this.paginate("dataPoints", (pageToken) => {
       const params = new URLSearchParams({ filter });
       if (pageSize) params.set("pageSize", String(pageSize));
@@ -149,23 +110,6 @@ export class GoogleHealthClient {
     });
   }
 
-  /**
-   * Reconciled data points over an inclusive date range. This is the right
-   * method for daily-aggregated types — `daily-resting-heart-rate`,
-   * `daily-heart-rate-variability`, `sleep` — which do NOT support dailyRollUp.
-   *
-   * The filterable time member differs by data type: interval types like
-   * `sleep` filter on `interval.civil_start_time`, whereas the daily computed
-   * types expose a single `date` field. Values are plain "YYYY-MM-DD"; the
-   * inclusive end is advanced one day to form the exclusive upper bound.
-   *
-   * @param dataType    e.g. "daily-resting-heart-rate", "sleep"
-   * @param startDate   inclusive "YYYY-MM-DD"
-   * @param endDate     inclusive "YYYY-MM-DD"
-   * @param opts.timeMember        member path after the data type, default
-   *                               "interval.civil_start_time"; use "date" for daily types
-   * @param opts.dataSourceFamily  optional, e.g. "users/me/dataSourceFamilies/google-wearables"
-   */
   async reconcile(
     dataType: string,
     startDate: string,
@@ -188,18 +132,6 @@ export class GoogleHealthClient {
     );
   }
 
-  /**
-   * Data points via the plain list endpoint over an inclusive date range,
-   * using the same AIP-160 filter grammar as `reconcile`. This is the right
-   * method for types that support `list` but NOT `reconcile` — currently
-   * `electrocardiogram` (filters on `interval.start_time`, physical) and
-   * `irregular-rhythm-notification` (filters on `sample_time.physical_time`).
-   *
-   * @param dataType    e.g. "electrocardiogram"
-   * @param startDate   inclusive "YYYY-MM-DD"
-   * @param endDate     inclusive "YYYY-MM-DD"
-   * @param opts        same filter knobs as `reconcile`, plus optional pageSize
-   */
   async listByDate(
     dataType: string,
     startDate: string,
@@ -223,10 +155,14 @@ export class GoogleHealthClient {
   }
 
   /**
-   * Follow `nextPageToken` until exhausted, concatenating each page's
-   * `arrayKey` array into the first page's response. Returns the merged
-   * response object with `nextPageToken` stripped.
+   * Create a single data point (write), e.g. a nutrition-log entry.
+   * Requires the matching write scope (googlehealth.nutrition.writeonly).
    */
+  async createDataPoint(dataType: string, body: unknown): Promise<unknown> {
+    const url = `${HEALTH_BASE}/users/me/dataTypes/${dataType}/dataPoints`;
+    return this.request(url, { method: "POST", body: JSON.stringify(body) });
+  }
+
   private async paginate(
     arrayKey: "dataPoints" | "rollupDataPoints",
     fetchPage: (pageToken?: string) => Promise<unknown>,
@@ -242,7 +178,6 @@ export class GoogleHealthClient {
       token = next.nextPageToken as string | undefined;
     }
 
-    // Don't synthesize an empty array if the response keys data elsewhere.
     if (!hadKey && items.length === 0) {
       delete merged.nextPageToken;
       return merged;
@@ -253,11 +188,6 @@ export class GoogleHealthClient {
     return merged;
   }
 
-  /**
-   * Fetch with bearer auth. On 401 we refresh the token once and retry; on a
-   * transient status (429/5xx) we back off and retry up to MAX_RETRIES,
-   * honouring a Retry-After header when present.
-   */
   private async request(
     url: string,
     init: RequestInit,
@@ -291,7 +221,6 @@ export class GoogleHealthClient {
     return res.json();
   }
 
-  /** Backoff delay: Retry-After if the server sent one, else exponential with jitter. */
   private backoffMs(res: Response, attempt: number): number {
     const retryAfter = res.headers.get("Retry-After");
     if (retryAfter) {
@@ -301,7 +230,6 @@ export class GoogleHealthClient {
     return Math.min(2 ** attempt * 300 + Math.random() * 200, 5_000);
   }
 
-  /** Exchange the refresh token for a fresh access token (mutates in place). */
   private async refresh(): Promise<void> {
     if (!this.refreshToken) throw new Error("No refresh token available");
     const res = await fetch(TOKEN_URL, {
