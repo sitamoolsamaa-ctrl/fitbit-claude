@@ -255,7 +255,6 @@ export function registerTools(
             totalCarbohydrate: { grams: carbs_g },
             totalFat: { grams: fat_g },
             nutrients: [{ nutrient: "PROTEIN", quantity: { grams: protein_g } }],
-            serving: { amount: 1 },
           },
         };
         return jsonResult(await getClient().createDataPoint(DATA_TYPE.nutrition, body));
