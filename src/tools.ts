@@ -402,4 +402,140 @@ export function registerTools(
       title: "Cardiac Events (ECG & Irregular Rhythm)",
       description: "Get ECG recordings and irregular-rhythm notifications over a date range. Informational only, not a medical diagnosis.",
       inputSchema: {
-        
+            start_date: DATE.describe("Inclusive start, YYYY-MM-DD."),
+        end_date: DATE.describe("Inclusive end, YYYY-MM-DD."),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ start_date, end_date }) => {
+      try {
+        const client = getClient();
+        const [ecg, irregularRhythm] = await Promise.all([
+          client.listByDate(DATA_TYPE.electrocardiogram, start_date, end_date, ECG_FILTER),
+          client.listByDate(DATA_TYPE.irregularRhythm, start_date, end_date, BY_SAMPLE_TIME),
+        ]);
+        return jsonResult({ ecg, irregularRhythm });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "query_data_type",
+    {
+      title: "Query Any Data Type (advanced)",
+      description: "Directly query any Google Health API v4 data type by ID over a date range. Method guide: dailyRollUp for daily aggregates of interval types (steps, heart-rate, floors); reconcile for daily-* computed types (time_member=\"date\"), sessions (sleep: time_member=\"interval.end_time\" physical; exercise: default), and measurements (time_member=\"sample_time.physical_time\" physical); list only for electrocardiogram/irregular-rhythm-notification.",
+      inputSchema: {
+        data_type: z.string().regex(/^[a-z0-9-]+$/).describe("Data type ID in kebab-case, e.g. \"activity-level\"."),
+        method: z.enum(["dailyRollUp", "reconcile", "list"]).default("reconcile").describe("API method to use."),
+        start_date: DATE.describe("Inclusive start, YYYY-MM-DD."),
+        end_date: DATE.describe("Inclusive end, YYYY-MM-DD."),
+        time_member: z.string().optional().describe("Filter time member for reconcile/list. Default \"interval.civil_start_time\"."),
+        physical: z.boolean().optional().describe("Set true when the time member is a physical Timestamp."),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ data_type, method, start_date, end_date, time_member, physical }) => {
+      try {
+        const client = getClient();
+        const opts = { timeMember: time_member, physical };
+        const result =
+          method === "dailyRollUp"
+            ? await client.dailyRollUp(data_type, start_date, end_date)
+            : method === "list"
+              ? await client.listByDate(data_type, start_date, end_date, opts)
+              : await client.reconcile(data_type, start_date, end_date, opts);
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_my_data",
+    {
+      title: "Delete My Cached Data",
+      description: "Delete all of your health data cached by this connector. This does not change your data in Google Health.",
+      inputSchema: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        const deleted = await purgeCache();
+        return jsonResult({
+          deletedCacheEntries: deleted,
+          note: "Cached data cleared. To fully revoke access, remove this app at https://myaccount.google.com/permissions and disconnect the connector in Claude.",
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "run_diagnostics",
+    {
+      title: "Run Diagnostics",
+      description: "Probe each Google Health data type over the last few days and report per-metric status (ok / empty / error).",
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async () => {
+      const end = todayIso(timeZone);
+      const start = isoDaysAgo(3, timeZone);
+      const client = getClient();
+
+      const probes: { metric: string; run: () => Promise<unknown> }[] = [
+        { metric: "sleep", run: () => client.reconcile(DATA_TYPE.sleep, start, end, SLEEP_FILTER) },
+        { metric: "resting_heart_rate", run: () => client.reconcile(DATA_TYPE.restingHeartRate, start, end, BY_DATE) },
+        { metric: "hrv", run: () => client.reconcile(DATA_TYPE.heartRateVariability, start, end, BY_DATE) },
+        { metric: "active_zone_minutes", run: () => client.dailyRollUp(DATA_TYPE.activeZoneMinutes, start, end) },
+        { metric: "heart_rate", run: () => client.dailyRollUp(DATA_TYPE.heartRate, start, end) },
+        { metric: "steps", run: () => client.dailyRollUp(DATA_TYPE.steps, start, end) },
+        { metric: "distance", run: () => client.dailyRollUp(DATA_TYPE.distance, start, end) },
+        { metric: "total_calories", run: () => client.dailyRollUp(DATA_TYPE.totalCalories, start, end) },
+        { metric: "weight", run: () => client.dailyRollUp(DATA_TYPE.weight, start, end) },
+        { metric: "body_fat", run: () => client.dailyRollUp(DATA_TYPE.bodyFat, start, end) },
+        { metric: "respiratory_rate", run: () => client.reconcile(DATA_TYPE.respiratoryRate, start, end, BY_DATE) },
+        { metric: "oxygen_saturation", run: () => client.reconcile(DATA_TYPE.oxygenSaturation, start, end, BY_DATE) },
+        { metric: "vo2_max", run: () => client.reconcile(DATA_TYPE.vo2Max, start, end, BY_DATE) },
+        { metric: "run_vo2_max", run: () => client.dailyRollUp(DATA_TYPE.runVo2Max, start, end) },
+        { metric: "nutrition", run: () => client.dailyRollUp(DATA_TYPE.nutrition, start, end) },
+        { metric: "hydration", run: () => client.dailyRollUp(DATA_TYPE.hydration, start, end) },
+        { metric: "skin_temperature", run: () => client.reconcile(DATA_TYPE.skinTemperature, start, end, BY_DATE) },
+        { metric: "core_body_temperature", run: () => client.dailyRollUp(DATA_TYPE.coreBodyTemperature, start, end) },
+        { metric: "blood_glucose", run: () => client.dailyRollUp(DATA_TYPE.bloodGlucose, start, end) },
+        { metric: "heart_rate_zones", run: () => client.reconcile(DATA_TYPE.heartRateZones, start, end, BY_DATE) },
+        { metric: "time_in_heart_rate_zone", run: () => client.dailyRollUp(DATA_TYPE.timeInHeartRateZone, start, end) },
+        { metric: "calories_in_heart_rate_zone", run: () => client.dailyRollUp(DATA_TYPE.caloriesInHeartRateZone, start, end) },
+        { metric: "exercise", run: () => client.reconcile(DATA_TYPE.exercise, start, end) },
+        { metric: "floors", run: () => client.dailyRollUp(DATA_TYPE.floors, start, end) },
+        { metric: "active_minutes", run: () => client.dailyRollUp(DATA_TYPE.activeMinutes, start, end) },
+        { metric: "active_energy_burned", run: () => client.dailyRollUp(DATA_TYPE.activeEnergyBurned, start, end) },
+        { metric: "sedentary_period", run: () => client.dailyRollUp(DATA_TYPE.sedentaryPeriod, start, end) },
+        { metric: "swim_lengths", run: () => client.dailyRollUp(DATA_TYPE.swimLengths, start, end) },
+        { metric: "altitude", run: () => client.dailyRollUp(DATA_TYPE.altitude, start, end) },
+        { metric: "height", run: () => client.reconcile(DATA_TYPE.height, start, end, BY_SAMPLE_TIME) },
+        { metric: "respiratory_rate_sleep_summary", run: () => client.reconcile(DATA_TYPE.respiratoryRateSleepSummary, start, end, BY_SAMPLE_TIME) },
+        { metric: "electrocardiogram", run: () => client.listByDate(DATA_TYPE.electrocardiogram, start, end, ECG_FILTER) },
+        { metric: "irregular_rhythm_notification", run: () => client.listByDate(DATA_TYPE.irregularRhythm, start, end, BY_SAMPLE_TIME) },
+      ];
+
+      const results = await Promise.all(
+        probes.map(async (p) => {
+          try {
+            const points = countItems(await p.run());
+            return { metric: p.metric, status: points > 0 ? "ok" : "empty", points };
+          } catch (err) {
+            return { metric: p.metric, status: "error", error: err instanceof Error ? err.message : String(err) };
+          }
+        }),
+      );
+
+      return jsonResult({ window: { start, end }, timeZone, results });
+    },
+  );
+}
+    
